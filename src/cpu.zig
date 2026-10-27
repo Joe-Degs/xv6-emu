@@ -179,6 +179,10 @@ fn decode(inst: u32) Error!Instruction {
     };
 }
 
+fn sext32(x: u32) u64 {
+    return @bitCast(@as(i64, @as(i32, @bitCast(x))));
+}
+
 pub const Cpu = struct {
     regs: [32]u64 = [_]u64{0} ** 32,
     pc: u64 = mem.Dram.base,
@@ -210,13 +214,58 @@ pub const Cpu = struct {
         switch (inst) {
             .op => |r| try self.op(r),
             .op_imm => |i| try self.opImm(i),
+            .op_imm_32 => |i| try self.opImm32(i),
+            .op_32 => |r| try self.op32(r),
             .lui => |u| self.lui(u),
             .auipc => |u| self.auipc(u),
             .jal => |j| return self.jal(j),
             .jalr => |i| return self.jalr(i),
+            .branch => |b| return self.branch(b),
+            .load => |i| try self.load(i),
+            .store => |s| try self.store(s),
+            .misc_mem => |i| try self.miscMem(i),
             else => return error.IllegalInstruction,
         }
         return self.pc + 4;
+    }
+
+    // I: lb lh lw ld lbu lhu lwu
+    fn load(self: *Cpu, i: Itype) (Error || mem.Error)!void {
+        const addr = self.get(i.rs1) +% @as(u64, @bitCast(i.imm()));
+        self.set(i.rd, switch (i.funct3) {
+            // lb
+            0b000 => @bitCast(@as(i64, try self.bus.load(i8, addr))),
+            // lh
+            0b001 => @bitCast(@as(i64, try self.bus.load(i16, addr))),
+            // lw
+            0b010 => @bitCast(@as(i64, try self.bus.load(i32, addr))),
+            // ld
+            0b011 => try self.bus.load(u64, addr),
+            // lbu
+            0b100 => try self.bus.load(u8, addr),
+            // lhu
+            0b101 => try self.bus.load(u16, addr),
+            // lwu
+            0b110 => try self.bus.load(u32, addr),
+            else => return error.IllegalInstruction,
+        });
+    }
+
+    // S: sb sh sw sd
+    fn store(self: *Cpu, s: Stype) (Error || mem.Error)!void {
+        const addr = self.get(s.rs1) +% @as(u64, @bitCast(s.imm()));
+        const val = self.get(s.rs2);
+        switch (s.funct3) {
+            // sb
+            0b000 => try self.bus.store(u8, addr, @truncate(val)),
+            // sh
+            0b001 => try self.bus.store(u16, addr, @truncate(val)),
+            // sw
+            0b010 => try self.bus.store(u32, addr, @truncate(val)),
+            // sd
+            0b011 => try self.bus.store(u64, addr, val),
+            else => return error.IllegalInstruction,
+        }
     }
 
     // I: addi slti sltiu xori ori andi slli srli srai
@@ -245,7 +294,60 @@ pub const Cpu = struct {
         });
     }
 
-    fn branch(self: *Cpu, b: Btype) void {
+    // I: fence fence.i
+    fn miscMem(self: *Cpu, i: Itype) Error!void {
+        _ = self;
+        switch (i.funct3) {
+            // fence
+            0b000 => {},
+            // fence.i
+            0b001 => {},
+            else => return error.IllegalInstruction,
+        }
+    }
+
+    // I: addiw slliw srliw sraiw
+    fn opImm32(self: *Cpu, i: Itype) Error!void {
+        const rs1: u32 = @truncate(self.get(i.rs1));
+        const imm: u32 = @bitCast(@as(i32, @truncate(i.imm())));
+        const shamt: u5 = @truncate(i.imm11_0);
+        const funct7: u7 = @truncate(i.imm11_0 >> 5);
+        self.set(i.rd, sext32(switch (i.funct3) {
+            // addiw
+            0b000 => rs1 +% imm,
+            // slliw
+            0b001 => if (funct7 == 0b0000000) rs1 << shamt else return error.IllegalInstruction,
+            0b101 => switch (funct7) {
+                // srliw
+                0b0000000 => rs1 >> shamt,
+                // sraiw
+                0b0100000 => @bitCast(@as(i32, @bitCast(rs1)) >> shamt),
+                else => return error.IllegalInstruction,
+            },
+            else => return error.IllegalInstruction,
+        }));
+    }
+
+    fn branch(self: *Cpu, b: Btype) Error!u64 {
+        const rs1 = self.get(b.rs1);
+        const rs2 = self.get(b.rs2);
+        const taken = self.pc +% @as(u64, @bitCast(b.imm()));
+        const next = self.pc + 4;
+        return switch (b.funct3) {
+            // beq
+            0b000 => if (rs1 == rs2) taken else next,
+            // bne
+            0b001 => if (rs1 != rs2) taken else next,
+            // blt
+            0b100 => if (@as(i64, @bitCast(rs1)) < @as(i64, @bitCast(rs2))) taken else next,
+            // bge
+            0b101 => if (@as(i64, @bitCast(rs1)) >= @as(i64, @bitCast(rs2))) taken else next,
+            // bltu
+            0b110 => if (rs1 < rs2) taken else next,
+            // bgeu
+            0b111 => if (rs1 >= rs2) taken else next,
+            else => error.IllegalInstruction,
+        };
     }
 
     // U: lui
@@ -299,6 +401,27 @@ pub const Cpu = struct {
             0b111 => rs1 & rs2,
             else => return error.IllegalInstruction,
         });
+    }
+
+    // R: addw subw sllw srlw sraw
+    fn op32(self: *Cpu, r: Rtype) Error!void {
+        const rs1: u32 = @truncate(self.get(r.rs1));
+        const rs2: u32 = @truncate(self.get(r.rs2));
+        const shamt: u5 = @truncate(rs2);
+        const key = @as(u10, r.funct7) << 3 | r.funct3;
+        self.set(r.rd, sext32(switch (key) {
+            // addw
+            0b000 => rs1 +% rs2,
+            // subw
+            0b0100000_000 => rs1 -% rs2,
+            // sllw
+            0b001 => rs1 << shamt,
+            // srlw
+            0b101 => rs1 >> shamt,
+            // sraw
+            0b0100000_101 => @bitCast(@as(i32, @bitCast(rs1)) >> shamt),
+            else => return error.IllegalInstruction,
+        }));
     }
 };
 
@@ -473,4 +596,231 @@ test "jal and jalr" {
     try std.testing.expectEqual(mem.Dram.base + 20, cpu.get(.s1));
     try std.testing.expectEqual(mem.Dram.base + 32, cpu.get(.t1));
     try std.testing.expectEqual(mem.Dram.base + 44, cpu.pc);
+}
+
+test "branch" {
+    const taken = 1;
+    const not_taken = 0;
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try runProgram(&cpu,
+        \\    li    t0, -1
+        \\    li    t1, 1
+        \\
+        \\    # -1 == -1
+        \\    li    a0, 1
+        \\    beq   t0, t0, 1f
+        \\    li    a0, 0
+        \\1:
+        \\    # -1 != -1
+        \\    li    a1, 1
+        \\    bne   t0, t0, 1f
+        \\    li    a1, 0
+        \\1:
+        \\    # signed: -1 < 1
+        \\    li    a2, 1
+        \\    blt   t0, t1, 1f
+        \\    li    a2, 0
+        \\1:
+        \\    # unsigned: 0xffff_ffff_ffff_ffff < 1
+        \\    li    a3, 1
+        \\    bltu  t0, t1, 1f
+        \\    li    a3, 0
+        \\1:
+        \\    # signed: 1 >= 1, equal counts
+        \\    li    a4, 1
+        \\    bge   t1, t1, 1f
+        \\    li    a4, 0
+        \\1:
+        \\    # unsigned: 0xffff_ffff_ffff_ffff >= 1
+        \\    li    a5, 1
+        \\    bgeu  t0, t1, 1f
+        \\    li    a5, 0
+        \\1:
+        \\    # unsigned: 1 >= 1, equal counts
+        \\    li    a6, 1
+        \\    bgeu  t1, t1, 1f
+        \\    li    a6, 0
+        \\1:
+        \\    # backward branch: negative offset, loops 3 times
+        \\    li    t2, 3
+        \\loop:
+        \\    addi  s0, s0, 1
+        \\    addi  t2, t2, -1
+        \\    bne   t2, zero, loop
+    );
+    try std.testing.expectEqual(taken, cpu.get(.a0));
+    try std.testing.expectEqual(not_taken, cpu.get(.a1));
+    try std.testing.expectEqual(taken, cpu.get(.a2));
+    try std.testing.expectEqual(not_taken, cpu.get(.a3));
+    try std.testing.expectEqual(taken, cpu.get(.a4));
+    try std.testing.expectEqual(taken, cpu.get(.a5));
+    try std.testing.expectEqual(taken, cpu.get(.a6));
+    try std.testing.expectEqual(3, cpu.get(.s0));
+}
+
+test "branch: funct3 010 is illegal" {
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu,
+        \\    .insn b 0x63, 2, a0, a1, 0
+    ));
+}
+
+test "load and store" {
+    const all_ones: u64 = std.math.maxInt(u64);
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try runProgram(&cpu,
+        \\    # s0 = scratch memory, 1 KiB past the code
+        \\    auipc s0, 0
+        \\    addi  s0, s0, 1024
+        \\    li    t0, -1
+        \\
+        \\    # all ones at s0+0, read back at every width
+        \\    sd    t0, 0(s0)
+        \\    lb    a0, 0(s0)
+        \\    lbu   a1, 0(s0)
+        \\    lh    a2, 0(s0)
+        \\    lhu   a3, 0(s0)
+        \\    lw    a4, 0(s0)
+        \\    lwu   a5, 0(s0)
+        \\    ld    a6, 0(s0)
+        \\
+        \\    # all ones, then zero only the low byte, half, word
+        \\    sd    t0, 8(s0)
+        \\    sb    zero, 8(s0)
+        \\    ld    s1, 8(s0)
+        \\    sd    t0, 16(s0)
+        \\    sh    zero, 16(s0)
+        \\    ld    s2, 16(s0)
+        \\    sd    t0, 24(s0)
+        \\    sw    zero, 24(s0)
+        \\    ld    s3, 24(s0)
+        \\
+        \\    # negative offset reaches back to s0+0
+        \\    addi  t1, s0, 8
+        \\    ld    s4, -8(t1)
+    );
+    try std.testing.expectEqual(all_ones, cpu.get(.a0));
+    try std.testing.expectEqual(0xff, cpu.get(.a1));
+    try std.testing.expectEqual(all_ones, cpu.get(.a2));
+    try std.testing.expectEqual(0xffff, cpu.get(.a3));
+    try std.testing.expectEqual(all_ones, cpu.get(.a4));
+    try std.testing.expectEqual(0xffff_ffff, cpu.get(.a5));
+    try std.testing.expectEqual(all_ones, cpu.get(.a6));
+    try std.testing.expectEqual(0xffff_ffff_ffff_ff00, cpu.get(.s1));
+    try std.testing.expectEqual(0xffff_ffff_ffff_0000, cpu.get(.s2));
+    try std.testing.expectEqual(0xffff_ffff_0000_0000, cpu.get(.s3));
+    try std.testing.expectEqual(all_ones, cpu.get(.s4));
+}
+
+test "load and store: unused funct3 is illegal" {
+    for ([_][]const u8{
+        \\    .insn i 0x03, 7, a0, 0(a1)
+        ,
+        \\    .insn s 0x23, 4, a0, 0(a1)
+    }) |src| {
+        var cpu = try Cpu.init(std.testing.allocator, 4096);
+        defer cpu.deinit();
+        try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu, src));
+    }
+}
+
+test "op_imm_32" {
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try runProgram(&cpu,
+        \\    # t0 = 0xffff_ffff_8000_0000, low word is the smallest i32
+        \\    lui   t0, 0x80000
+        \\    # t1 = 0x0000_0001_0000_0000, low word is zero
+        \\    addi  t1, zero, 1
+        \\    slli  t1, t1, 32
+        \\
+        \\    # addiw wraps at 32 bits: smallest i32 - 1 = largest i32
+        \\    addiw a0, t0, -1
+        \\    # sext.w drops the upper word
+        \\    sext.w a1, t1
+        \\    # slliw into bit 31 goes negative
+        \\    addi  t2, zero, 1
+        \\    slliw a2, t2, 31
+        \\    # srliw by 0 still sign-extends
+        \\    srliw a3, t0, 0
+        \\    # srliw shifts zeros into bit 31, ignoring the upper word
+        \\    srliw a4, t0, 1
+        \\    # sraiw copies bit 31
+        \\    sraiw a5, t0, 31
+    );
+    try std.testing.expectEqual(0x0000_0000_7fff_ffff, cpu.get(.a0));
+    try std.testing.expectEqual(0, cpu.get(.a1));
+    try std.testing.expectEqual(0xffff_ffff_8000_0000, cpu.get(.a2));
+    try std.testing.expectEqual(0xffff_ffff_8000_0000, cpu.get(.a3));
+    try std.testing.expectEqual(0x0000_0000_4000_0000, cpu.get(.a4));
+    try std.testing.expectEqual(0xffff_ffff_ffff_ffff, cpu.get(.a5));
+}
+
+test "op_imm_32: shamt over 31 is illegal" {
+    for ([_][]const u8{
+        \\    .insn i 0x1b, 1, a0, a1, 32
+        ,
+        \\    .insn i 0x1b, 5, a0, a1, 32
+    }) |src| {
+        var cpu = try Cpu.init(std.testing.allocator, 4096);
+        defer cpu.deinit();
+        try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu, src));
+    }
+}
+
+test "op_32" {
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try runProgram(&cpu,
+        \\    # t0 = 0xffff_ffff_8000_0000, low word is the smallest i32
+        \\    lui   t0, 0x80000
+        \\    # t1 = 0x0000_0001_0000_0001, upper word is garbage to ignore
+        \\    addi  t1, zero, 1
+        \\    slli  t1, t1, 32
+        \\    addi  t1, t1, 1
+        \\    addi  t2, zero, 33
+        \\
+        \\    # addw ignores the upper word: 1 + 1
+        \\    addw  a0, t1, t1
+        \\    # subw wraps at 32 bits: smallest i32 - 1 = largest i32
+        \\    subw  a1, t0, t1
+        \\    # sllw by 33 shifts by 1, only rs2[4:0] counts
+        \\    sllw  a2, t1, t2
+        \\    # srlw by 0 still sign-extends
+        \\    srlw  a3, t0, zero
+        \\    # sraw copies bit 31
+        \\    sraw  a4, t0, t2
+    );
+    try std.testing.expectEqual(2, cpu.get(.a0));
+    try std.testing.expectEqual(0x0000_0000_7fff_ffff, cpu.get(.a1));
+    try std.testing.expectEqual(2, cpu.get(.a2));
+    try std.testing.expectEqual(0xffff_ffff_8000_0000, cpu.get(.a3));
+    try std.testing.expectEqual(0xffff_ffff_c000_0000, cpu.get(.a4));
+}
+
+test "op_32: unknown funct7 is illegal" {
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu,
+        \\    .insn r 0x3b, 0, 2, a0, a1, a2
+    ));
+}
+
+test "misc_mem" {
+    var cpu = try Cpu.init(std.testing.allocator, 4096);
+    defer cpu.deinit();
+    try runProgram(&cpu,
+        \\    fence
+        \\    fence.i
+    );
+    try std.testing.expectEqual(mem.Dram.base + 8, cpu.pc);
+
+    var bad = try Cpu.init(std.testing.allocator, 4096);
+    defer bad.deinit();
+    try std.testing.expectError(error.IllegalInstruction, runProgram(&bad,
+        \\    .insn i 0x0f, 2, zero, zero, 0
+    ));
 }

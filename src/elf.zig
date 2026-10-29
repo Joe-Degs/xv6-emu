@@ -102,7 +102,7 @@ pub fn load(self: Self, bus: *mem.Bus) mem.Error!u64 {
     return self.header.entry;
 }
 
-fn link(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+pub fn link(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{
         "sh", "-c",
         \\dir=$(mktemp -d) &&

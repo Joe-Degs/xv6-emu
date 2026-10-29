@@ -1,71 +1,117 @@
 const std = @import("std");
-const Io = std.Io;
+const Machine = @import("machine.zig");
+const cpu = @import("cpu.zig");
 
-const xv6_emu = @import("xv6_emu");
+pub fn parse(comptime T: type, args: []const []const u8) !T {
+    const fields = @typeInfo(T).@"struct".fields;
+    var result: T = undefined;
+    var seen = [_]bool{false} ** fields.len;
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 == args.len) return error.MissingValue;
+        inline for (fields, 0..) |field, f| {
+            if (std.mem.eql(u8, args[i], "-" ++ field.name)) {
+                @field(result, field.name) = try parseValue(field.type, args[i + 1]);
+                seen[f] = true;
+                break;
+            }
+        } else return error.UnknownFlag;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    inline for (fields, 0..) |field, f| {
+        if (!seen[f])
+            @field(result, field.name) = field.defaultValue() orelse return error.MissingFlag;
+    }
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try xv6_emu.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    return result;
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+fn parseValue(comptime T: type, text: []const u8) !T {
+    if (T == []const u8) return text;
+    return switch (@typeInfo(T)) {
+        .int => std.fmt.parseInt(T, text, 10),
+        .@"struct" => T.parse(text),
+        else => @compileError("no parser for " ++ @typeName(T)),
     };
+}
+
+const Size = struct {
+    bytes: usize,
+
+    fn mib(n: usize) Size {
+        return .{ .bytes = n << 20 };
+    }
+
+    // qemu style: 64M, 1G, 512K; a bare number is MiB
+    fn parse(text: []const u8) !Size {
+        if (text.len == 0) return error.InvalidCharacter;
+        const shift: u6 = switch (text[text.len - 1]) {
+            'K' => 10,
+            'M' => 20,
+            'G' => 30,
+            else => return mib(try std.fmt.parseInt(usize, text, 10)),
+        };
+        return .{ .bytes = try std.fmt.parseInt(usize, text[0 .. text.len - 1], 10) << shift };
+    }
+};
+
+const Opts = struct {
+    kernel: []const u8,
+    m: Size = .mib(128),
+    smp: usize = 1,
+    d: Machine.Debug = .{},
+};
+
+const usage =
+    \\usage: {s} -kernel <path> [-m <size>] [-smp <n>]
+    \\  -kernel <path>    ELF to load
+    \\  -m <size>         dram size, like qemu: 128M (default), 1G
+    \\  -smp <n>          number of harts (default 1)
+;
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+
+    const args = try init.minimal.args.toSlice(arena);
+    const opts = parse(Opts, args[1..]) catch |err|
+        std.process.fatal("{t}\n" ++ usage, .{ err, args[0] });
+
+    const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel, arena, .limited(opts.m.bytes));
+
+    var machine: Machine = undefined;
+    try machine.init(init.gpa, opts.m.bytes, opts.smp);
+    defer machine.deinit();
+    try machine.load(kernel);
+
+    var buf: [4096]u8 = undefined;
+    var stderr = std.Io.File.stderr().writer(init.io, &buf);
+    const log = &stderr.interface;
+    defer log.flush() catch {};
+
+    machine.run(opts.d, log) catch {
+        for (machine.cpus[0..machine.num_cpus], 0..) |hart, id| {
+            const trap = hart.trap orelse continue;
+            // const word = machine.bus.load(u32, trap.epc) catch 0;
+            // std.debug.print(
+            //     \\error: {t}
+            //     \\  hart {d}  pc 0x{x:0>16}  inst 0x{x:0>8}  tval 0x{x}
+            //     \\  decoded {any}
+            //     \\
+            //     \\{f}
+            // , .{ trap.cause, id, trap.epc, word, trap.tval, cpu.decode(word) catch null, hart });
+            try log.print("error: {t}  tval 0x{x}\n", .{ trap.cause, trap.tval });
+            try Machine.traceInst(log, id, hart);
+            try log.print("\n{f}", .{hart});
+        }
+        try log.flush();
+        std.process.exit(1);
+    };
+}
+
+test {
+    _ = @import("cpu.zig");
+    _ = @import("elf.zig");
+    _ = @import("machine.zig");
+    _ = @import("mem.zig");
 }

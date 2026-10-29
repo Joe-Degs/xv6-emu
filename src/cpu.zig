@@ -4,6 +4,13 @@ const std = @import("std");
 const mem = @import("./mem.zig");
 
 pub const Error = error{IllegalInstruction};
+pub const StepError = Error || mem.Error;
+
+pub const Trap = struct {
+    cause: StepError,
+    epc: u64,
+    tval: u64,
+};
 
 const registers = enum(u5) {
     zero, // read as zero, write is ignored
@@ -40,7 +47,7 @@ const registers = enum(u5) {
     t6, // temp reg 6
 };
 
-const Instruction = union(enum) {
+pub const Instruction = union(enum) {
     op: Rtype,
     op_32: Rtype,
     amo: Rtype,
@@ -144,7 +151,8 @@ const Jtype = packed struct(u32) {
     }
 };
 
-fn decode(inst: u32) Error!Instruction {
+// decode risc-v inst
+pub fn decode(inst: u32) Error!Instruction {
     const opcode: u7 = @truncate(inst);
     return switch (opcode) {
         // R: add sub sll slt sltu xor srl sra or and, mul div rem
@@ -179,6 +187,7 @@ fn decode(inst: u32) Error!Instruction {
     };
 }
 
+// sign-extend for 32 bit ops to 64. needed for opp_imm_32 and op_32 type isntructions
 fn sext32(x: u32) u64 {
     return @bitCast(@as(i64, @as(i32, @bitCast(x))));
 }
@@ -186,31 +195,57 @@ fn sext32(x: u32) u64 {
 pub const Cpu = struct {
     regs: [32]u64 = [_]u64{0} ** 32,
     pc: u64 = mem.Dram.base,
-    bus: mem.Bus,
+    bus: *mem.Bus,
+    trap: ?Trap = null,
 
-    pub fn init(allocator: std.mem.Allocator, size: usize) !Cpu {
-        return .{ .bus = try mem.Bus.init(allocator, size) };
+    pub fn init(bus: *mem.Bus) !Cpu {
+        return .{ .bus = bus };
     }
 
-    pub fn deinit(self: *Cpu) void {
-        self.bus.deinit();
-    }
-
-    fn set(self: *Cpu, r: registers, val: u64) void {
+    // set register value
+    pub fn set(self: *Cpu, r: registers, val: u64) void {
         if (r == .zero) return;
         self.regs[@intFromEnum(r)] = val;
     }
 
-    fn get(self: Cpu, r: registers) u64 {
+    // get register value
+    pub fn get(self: Cpu, r: registers) u64 {
         return self.regs[@intFromEnum(r)];
     }
 
-    pub fn step(self: *Cpu) !void {
-        const inst = try decode(try self.bus.load(u32, self.pc));
-        self.pc = try self.execute(inst);
+    // execute next instruction and set pc on the cpu
+    pub fn step(self: *Cpu) StepError!void {
+        const word = self.bus.load(u32, self.pc) catch |err| return self.raise(err, self.pc);
+        const inst = decode(word) catch |err| return self.raise(err, word);
+        self.pc = self.execute(inst) catch |err| switch (err) {
+            error.IllegalInstruction => return self.raise(err, word),
+            else => return err,
+        };
     }
 
-    fn execute(self: *Cpu, inst: Instruction) !u64 {
+    fn raise(self: *Cpu, cause: StepError, tval: u64) StepError {
+        self.trap = .{ .cause = cause, .epc = self.pc, .tval = tval };
+        return cause;
+    }
+
+    fn read(self: *Cpu, comptime T: type, addr: u64) StepError!T {
+        return self.bus.load(T, addr) catch |err| self.raise(err, addr);
+    }
+
+    fn write(self: *Cpu, comptime T: type, addr: u64, val: T) StepError!void {
+        return self.bus.store(T, addr, val) catch |err| self.raise(err, addr);
+    }
+
+    pub fn format(self: Cpu, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (std.enums.values(registers), 0..) |r, i| {
+            try w.print("{s:<4} {x:0>16}", .{ @tagName(r), self.get(r) });
+            try w.writeAll(if (i % 4 == 3) "\n" else "  ");
+        }
+        try w.print("pc   {x:0>16}\n", .{self.pc});
+    }
+
+    // run instruction at pc and return the next pc
+    fn execute(self: *Cpu, inst: Instruction) StepError!u64 {
         switch (inst) {
             .op => |r| try self.op(r),
             .op_imm => |i| try self.opImm(i),
@@ -234,19 +269,19 @@ pub const Cpu = struct {
         const addr = self.get(i.rs1) +% @as(u64, @bitCast(i.imm()));
         self.set(i.rd, switch (i.funct3) {
             // lb
-            0b000 => @bitCast(@as(i64, try self.bus.load(i8, addr))),
+            0b000 => @bitCast(@as(i64, try self.read(i8, addr))),
             // lh
-            0b001 => @bitCast(@as(i64, try self.bus.load(i16, addr))),
+            0b001 => @bitCast(@as(i64, try self.read(i16, addr))),
             // lw
-            0b010 => @bitCast(@as(i64, try self.bus.load(i32, addr))),
+            0b010 => @bitCast(@as(i64, try self.read(i32, addr))),
             // ld
-            0b011 => try self.bus.load(u64, addr),
+            0b011 => try self.read(u64, addr),
             // lbu
-            0b100 => try self.bus.load(u8, addr),
+            0b100 => try self.read(u8, addr),
             // lhu
-            0b101 => try self.bus.load(u16, addr),
+            0b101 => try self.read(u16, addr),
             // lwu
-            0b110 => try self.bus.load(u32, addr),
+            0b110 => try self.read(u32, addr),
             else => return error.IllegalInstruction,
         });
     }
@@ -257,13 +292,13 @@ pub const Cpu = struct {
         const val = self.get(s.rs2);
         switch (s.funct3) {
             // sb
-            0b000 => try self.bus.store(u8, addr, @truncate(val)),
+            0b000 => try self.write(u8, addr, @truncate(val)),
             // sh
-            0b001 => try self.bus.store(u16, addr, @truncate(val)),
+            0b001 => try self.write(u16, addr, @truncate(val)),
             // sw
-            0b010 => try self.bus.store(u32, addr, @truncate(val)),
+            0b010 => try self.write(u32, addr, @truncate(val)),
             // sd
-            0b011 => try self.bus.store(u64, addr, val),
+            0b011 => try self.write(u64, addr, val),
             else => return error.IllegalInstruction,
         }
     }
@@ -456,8 +491,8 @@ test "decode rejects unknown opcodes" {
     try std.testing.expectError(error.IllegalInstruction, decode(0));
 }
 
-fn assemble(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
-    const result = try std.process.run(gpa, std.testing.io, .{ .argv = &.{
+fn assemble(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    const result = try std.process.run(allocator, std.testing.io, .{ .argv = &.{
         "sh", "-c",
         \\printf '%s\n' "$1" |
         \\llvm-mc -triple=riscv64 -mattr=-relax -filetype=obj -o - |
@@ -465,8 +500,8 @@ fn assemble(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
         ,
         "sh", src,
     } });
-    defer gpa.free(result.stderr);
-    errdefer gpa.free(result.stdout);
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
     if (result.term != .exited or result.term.exited != 0 or result.stderr.len != 0) {
         std.debug.print("{s}", .{result.stderr});
         return error.AssembleFailed;
@@ -483,8 +518,9 @@ fn runProgram(cpu: *Cpu, src: []const u8) !void {
 }
 
 test "op_imm" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\addi a0, zero, -1
         \\srli a1, a0, 60
@@ -505,16 +541,18 @@ test "op_imm" {
 }
 
 test "unimplemented group is illegal" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     // obscure instrution we will not need here
     try std.testing.expectError(Error.IllegalInstruction, runProgram(&cpu, ".word 0"));
     try std.testing.expectEqual(mem.Dram.base, cpu.pc);
 }
 
 test "op" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\addi t0, zero, -1
         \\srli t1, t0, 1
@@ -544,16 +582,18 @@ test "op: unknown funct7 is illegal" {
         ".insn r 0x33, 0, 2, a0, a1, a2",
         ".insn r 0x33, 1, 0x20, a0, a1, a2",
     }) |src| {
-        var cpu = try Cpu.init(std.testing.allocator, 4096);
-        defer cpu.deinit();
+        var bus = try mem.Bus.init(std.testing.allocator, 4096);
+        defer bus.deinit();
+        var cpu = try Cpu.init(&bus);
         try std.testing.expectError(Error.IllegalInstruction, runProgram(&cpu, src));
         try std.testing.expectEqual(mem.Dram.base, cpu.pc);
     }
 }
 
 test "lui and auipc" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\auipc a0, 0
         \\auipc a1, 1
@@ -571,8 +611,9 @@ test "lui and auipc" {
 }
 
 test "jal and jalr" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    jal   s0, over_a0
         \\    addi  a0, zero, 1
@@ -601,8 +642,9 @@ test "jal and jalr" {
 test "branch" {
     const taken = 1;
     const not_taken = 0;
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    li    t0, -1
         \\    li    t1, 1
@@ -660,8 +702,9 @@ test "branch" {
 }
 
 test "branch: funct3 010 is illegal" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu,
         \\    .insn b 0x63, 2, a0, a1, 0
     ));
@@ -669,8 +712,9 @@ test "branch: funct3 010 is illegal" {
 
 test "load and store" {
     const all_ones: u64 = std.math.maxInt(u64);
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    # s0 = scratch memory, 1 KiB past the code
         \\    auipc s0, 0
@@ -721,15 +765,17 @@ test "load and store: unused funct3 is illegal" {
         ,
         \\    .insn s 0x23, 4, a0, 0(a1)
     }) |src| {
-        var cpu = try Cpu.init(std.testing.allocator, 4096);
-        defer cpu.deinit();
+        var bus = try mem.Bus.init(std.testing.allocator, 4096);
+        defer bus.deinit();
+        var cpu = try Cpu.init(&bus);
         try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu, src));
     }
 }
 
 test "op_imm_32" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    # t0 = 0xffff_ffff_8000_0000, low word is the smallest i32
         \\    lui   t0, 0x80000
@@ -765,15 +811,17 @@ test "op_imm_32: shamt over 31 is illegal" {
         ,
         \\    .insn i 0x1b, 5, a0, a1, 32
     }) |src| {
-        var cpu = try Cpu.init(std.testing.allocator, 4096);
-        defer cpu.deinit();
+        var bus = try mem.Bus.init(std.testing.allocator, 4096);
+        defer bus.deinit();
+        var cpu = try Cpu.init(&bus);
         try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu, src));
     }
 }
 
 test "op_32" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    # t0 = 0xffff_ffff_8000_0000, low word is the smallest i32
         \\    lui   t0, 0x80000
@@ -802,24 +850,27 @@ test "op_32" {
 }
 
 test "op_32: unknown funct7 is illegal" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try std.testing.expectError(error.IllegalInstruction, runProgram(&cpu,
         \\    .insn r 0x3b, 0, 2, a0, a1, a2
     ));
 }
 
 test "misc_mem" {
-    var cpu = try Cpu.init(std.testing.allocator, 4096);
-    defer cpu.deinit();
+    var bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bus.deinit();
+    var cpu = try Cpu.init(&bus);
     try runProgram(&cpu,
         \\    fence
         \\    fence.i
     );
     try std.testing.expectEqual(mem.Dram.base + 8, cpu.pc);
 
-    var bad = try Cpu.init(std.testing.allocator, 4096);
-    defer bad.deinit();
+    var bad_bus = try mem.Bus.init(std.testing.allocator, 4096);
+    defer bad_bus.deinit();
+    var bad = try Cpu.init(&bad_bus);
     try std.testing.expectError(error.IllegalInstruction, runProgram(&bad,
         \\    .insn i 0x0f, 2, zero, zero, 0
     ));
